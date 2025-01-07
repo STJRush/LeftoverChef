@@ -1,56 +1,82 @@
-from flask import Flask, render_template, request, redirect, url_for
-from werkzeug.utils import secure_filename
-import openai
-import os
+from flask import Flask, request
+import base64
+import numpy as np
+import cv2
+from ultralytics import YOLO
 
 app = Flask(__name__)
 
-# Set your OpenAI API key securely
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Load YOLOv8 model (Nano version is smallest - you can try yolov8s.pt, etc.)
+model = YOLO('yolov8n.pt')
 
-UPLOAD_FOLDER = 'static/uploads/'
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-@app.route('/')
-def index():
-    return render_template('index.html')
+@app.route('/', methods=['GET'])
+def home_page():
+    # Simple HTML page with an upload form
+    return '''
+<html>
+    <head>
+        <title>YOLOv8 Food Detector</title>
+    </head>
+    <body>
+        <h1>Welcome to the YOLOv8 Food Detector</h1>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <p>Select an image file to upload:</p>
+            <input type="file" name="file" />
+            <button type="submit">Upload</button>
+        </form>
+    </body>
+</html>
+'''
 
 @app.route('/upload', methods=['POST'])
-def upload():
-    if 'food_image' not in request.files:
-        return redirect(url_for('index'))
-    file = request.files['food_image']
-    if file.filename == '':
-        return redirect(url_for('index'))
-    if file:
-        filename = secure_filename(file.filename)
-        image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(image_path)
-        
-        # Use GPT-4 to analyze the image and generate a recipe
-        recipe = generate_recipe_from_image(image_path)
-        
-        return render_template('results.html', recipe=recipe)
+def upload_file():
+    # Check if file part is present
+    if 'file' not in request.files:
+        return '''
+<html>
+    <body>
+        <p>No file part in the request</p>
+        <p><a href="/">Go Back</a></p>
+    </body>
+</html>
+'''
 
-def generate_recipe_from_image(image_path):
-    # Open the image file
-    with open(image_path, 'rb') as image_file:
-        image_data = image_file.read()
-    
-    # Use GPT-4 to analyze the image and generate a recipe
-    response = openai.Image.create_completion(
-        model="gpt-4-vision",
-        messages=[
-            {"role": "system", "content": "You are a helpful and creative chef."},
-            {"role": "user", "content": "Please generate a recipe based on this image of leftover food."}
-        ],
-        files={"file": image_data}
-    )
-    
-    # Extract the recipe from the response
-    recipe = response['choices'][0]['message']['content']
-    
-    return recipe
+    file = request.files['file']
+    image_bytes = file.read()
+
+    # Convert bytes to a CV2 image (BGR format)
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    # Run YOLOv8 inference with a confidence threshold
+    results = model.predict(source=img, conf=0.5)
+    detections = results[0]
+
+    detected_foods = []
+    for box in detections.boxes:
+        class_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        class_name = model.names[class_id]
+        if conf > 0.5:
+            detected_foods.append(class_name)
+
+    # Convert the uploaded image to base64 for display
+    base64_img = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = 'data:image/jpeg;base64,' + base64_img
+
+    # Build a results page that shows detected items and the uploaded image
+    return '''
+<html>
+    <head>
+        <title>Detection Results</title>
+    </head>
+    <body>
+        <h1>Detected foods: ''' + ', '.join(detected_foods) + '''</h1>
+        <p><img src="''' + data_url + '''" alt="Uploaded Image" /></p>
+        <p><a href="/">Go Back</a></p>
+    </body>
+</html>
+'''
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
